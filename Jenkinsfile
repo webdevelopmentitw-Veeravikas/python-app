@@ -1,31 +1,51 @@
+
 pipeline {
     agent any
 
-    //  environment {
-    //     AWS_REGION = 'ap-south-1'
-    //     AWS_ACCOUNT_ID = 'YOUR_AWS_ACCOUNT_ID'
-    //     ECR_REPO = '978355780378.dkr.ecr.ap-south-1.amazonaws.com'
-    //     EKS_CLUSTER = 'python-eks-cluster'
-    //     FULL_IMAGE = 'python-app'
-    //}
+    environment {
+        // AWS Configuration
+        AWS_DEFAULT_REGION = 'ap-south-1'
+        AWS_ACCOUNT_ID = '743186641965'
+
+        // ECR Configuration
+        ECR_REPOSITORY = 'python-app'
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+
+        // Docker Configuration
+        IMAGE_NAME = 'python-app'
+
+        // EKS Configuration
+        EKS_CLUSTER_NAME = 'demo-cluster-1'
+       
+
+        // SonarQube Configuration
+        SONAR_PROJECT_KEY = 'python-app'
+        SONAR_SERVER = 'SonarQube'
+
+        // Kubernetes Manifest
+        K8S_MANIFEST = 'pod.yaml'
+    }
 
     stages {
-        stage('Pull Code From GitHub') {
+
+        // 1. GitHub Checkout
+        stage('GitHub Checkout') {
             steps {
                 git branch: 'main',
-                    url: 'https://github.com/gnanaprabu-g/Python-CICD-Project.git'
+                    url: 'https://github.com/webdevelopmentitw-Veeravikas/python-app.git'
             }
         }
 
+        // 2. SonarQube Analysis
         stage('SonarQube Analysis') {
             steps {
                 script {
                     def scannerHome = tool 'sonar-scanner'
 
-                    withSonarQubeEnv('SonarQube') {
+                    withSonarQubeEnv("${SONAR_SERVER}") {
                         sh """
                             ${scannerHome}/bin/sonar-scanner \
-                            -Dsonar.projectKey=python-app \
+                            -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
                             -Dsonar.sources=.
                         """
                     }
@@ -33,68 +53,144 @@ pipeline {
             }
         }
 
+        // 3. Docker Build
         stage('Docker Build') {
             steps {
                 script {
-                    env.IMAGE_NAME = "python-app:${BUILD_NUMBER}"
+                    env.DOCKER_IMAGE =
+                        "${IMAGE_NAME}:${BUILD_NUMBER}"
                 }
 
                 sh '''
-                    docker build -t "$IMAGE_NAME" .
+                    set -e
+
+                    docker build -t "$DOCKER_IMAGE" .
+
                     docker images
                 '''
             }
         }
 
+        // 4. Trivy Image Scan
         stage('Trivy Image Scan') {
             steps {
-                sh 'trivy image ${IMAGE_NAME} > report.txt'
-            }
-        }
-
-        stage('ECR Push') {
-            steps {
-                script {
-                    env.ECR_IMAGE = "978355780378.dkr.ecr.ap-south-1.amazonaws.com/python-app:${BUILD_NUMBER}"
-                }
                 sh '''
                     set -e
-                    echo "Checking AWS account"
-                    aws sts get-caller-identity
-                    echo "ECR Login"
-                    aws ecr get-login-password \
-                        --region ap-south-1 | \
-                    docker login \
-                        --username AWS \
-                        --password-stdin \
-                        978355780378.dkr.ecr.ap-south-1.amazonaws.com
-                    echo "Docker Tag"
-                    docker tag python-app:${BUILD_NUMBER} "$ECR_IMAGE"
-                    echo "Docker Push"
-                    docker push "$ECR_IMAGE"
+
+                    trivy image \
+                    --format table \
+                    --severity HIGH,CRITICAL \
+                    "$DOCKER_IMAGE" | tee trivy-report.txt
                 '''
             }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-report.txt',
+                                     allowEmptyArchive: true
+                }
+            }
         }
+        
+       
 
-
-        stage('Deploy to EKS') {
+        // 5. AWS ECR Push
+        stage('ECR Push') {
             steps {
-                // Replace with your Jenkins AWS credential ID
-                withCredentials([aws(credentialsId: 'aws-creds', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                withCredentials([
+                    aws(
+                        credentialsId: 'aws-creds',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    script {
+                        env.ECR_IMAGE =
+                            "${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER}"
+                    }
+
                     sh '''
-                        aws eks update-kubeconfig --region ap-south-1 --name demo-cluster-1
-                        export KUBECONFIG=/var/lib/jenkins/.kube/config
-                        ECR_IMAGE=978355780378.dkr.ecr.ap-south-1.amazonaws.com/python-app:${BUILD_NUMBER}
-                        sed -i "s|_IMAGE_|$ECR_IMAGE|g" pod.yaml
-                        kubectl get nodes
-                        kubectl apply -f pod.yaml
-                        kubectl get pods
-                        kubectl get svc
+                        set -e
+
+                        echo "Checking AWS Identity"
+                        aws sts get-caller-identity
+
+                        echo "ECR Login"
+
+                        aws ecr get-login-password \
+                            --region "$AWS_DEFAULT_REGION" |
+                        docker login \
+                            --username AWS \
+                            --password-stdin "$ECR_REGISTRY"
+
+                        echo "Docker Tag"
+
+                        docker tag "$DOCKER_IMAGE" "$ECR_IMAGE"
+
+                        echo "Pushing Image to ECR"
+
+                        docker push "$ECR_IMAGE"
+
+                        echo "ECR Push Successful"
                     '''
                 }
             }
         }
 
+        // 6. Deploy to EKS
+        stage('Deploy to EKS') {
+            steps {
+                withCredentials([
+                    aws(
+                        credentialsId: 'aws-creds',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set -e
 
+                        echo "Updating EKS Kubeconfig"
+
+                        aws eks update-kubeconfig \
+                            --region "$AWS_DEFAULT_REGION" \
+                            --name "$EKS_CLUSTER_NAME"
+
+                        echo "Checking Kubernetes Nodes"
+
+                        kubectl get nodes
+
+                        echo "Updating Deployment Image"
+
+                        sed -i "s|_IMAGE_|${ECR_IMAGE}|g" "$K8S_MANIFEST"
+
+                        echo "Deploying Application"
+
+                        kubectl apply -f "$K8S_MANIFEST"
+
+                        echo "Checking Deployment"
+
+
+                        kubectl get pods
+                        kubectl get svc
+
+                        echo "Deployment Successful"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'CI/CD Pipeline Completed Successfully!'
+        }
+
+        failure {
+            echo 'CI/CD Pipeline Failed! Check Jenkins Console Output.'
+        }
+
+        always {
+            echo 'Pipeline Execution Finished.'
+        }
     }
 }
